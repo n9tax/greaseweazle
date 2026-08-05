@@ -10,7 +10,7 @@
 description = "Interactive live disk/drive diagnostic."
 
 import os, sys, time
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 from greaseweazle import error
 from greaseweazle import usb as USB
@@ -19,7 +19,7 @@ from greaseweazle.codec import codec  # noqa: F401
 from greaseweazle.codec.ibm.ibm import Mode
 from greaseweazle.tools import util
 from greaseweazle.tools.delays import Delays
-from greaseweazle.tools.diag import pinmap, decode, keyboard
+from greaseweazle.tools.diag import pinmap, decode, keyboard, batch
 
 # ANSI color for the live sector count: bright green on a complete read,
 # bright red otherwise. Windows 10+ consoles support these once virtual-
@@ -95,6 +95,21 @@ class State:
         self.density = False
         self.last_rpm: Optional[float] = None  # self-corrects the read window
         self.err_streak = 0  # consecutive ticks with no index (for recovery)
+        # Set in --batch mode. While it is None, notices print as text.
+        self.chan: Optional[batch.Channel] = None
+
+
+def notice(st: State, msg: str, level: str = 'info') -> None:
+    """Tell the user something out-of-band: a failed seek, a recalibration.
+
+    Interactively that is a printed line in among the status lines. Under
+    --batch it becomes an event record, so a front-end can surface it in its
+    own UI instead of the caller having to scrape stderr for it.
+    """
+    if st.chan is not None:
+        st.chan.send(batch.event_record(msg, level))
+    else:
+        print(msg)
 
 
 def sync_density_pin(usb: USB.Unit, st: State) -> None:
@@ -123,7 +138,7 @@ def try_seek(usb: USB.Unit, st: State, new_cyl: int) -> None:
         usb.seek(phys_cyl, st.head)
         st.cyl = new_cyl
     except (error.Fatal, USB.CmdError) as e:
-        print(str(e))
+        notice(st, str(e), 'error')
         return
     if st.args.gen_tg43:
         st.density = st.cyl < pinmap.TG43_TRACK_THRESHOLD
@@ -137,7 +152,7 @@ MAX_RECAL_STEPS = 80
 
 
 def recalibrate(usb: USB.Unit, st: State) -> None:
-    print('Recalibrating to track 0')
+    notice(st, 'Recalibrating to track 0')
     prior = st.cyl
 
     # A previous failed/aborted seek can leave the firmware's internal
@@ -160,7 +175,7 @@ def recalibrate(usb: USB.Unit, st: State) -> None:
         usb.drive_motor(st.args.drive.unit_id, st.motor)
         sync_density_pin(usb, st)
     except USB.CmdError as e:
-        print('Recalibration reset failed: %s' % e)
+        notice(st, 'Recalibration reset failed: %s' % e, 'error')
         return
 
     for cyl in range(0, -MAX_RECAL_STEPS, -1):
@@ -180,13 +195,53 @@ def recalibrate(usb: USB.Unit, st: State) -> None:
             st.cyl = 0
             try_seek(usb, st, prior)
             return
-    print('Track 0 signal never asserted after %d steps -- '
-          'bad TK0 sensor or heads stuck?' % MAX_RECAL_STEPS)
+    notice(st, 'Track 0 signal never asserted after %d steps -- '
+           'bad TK0 sensor or heads stuck?' % MAX_RECAL_STEPS, 'error')
     # prior is very likely 0 here (that's the common way this loop gets
     # triggered) -- don't re-run the same failing seek(0) and dump the raw
     # firmware error a second time right after our own diagnostic.
     if prior != 0:
         try_seek(usb, st, prior)
+
+
+# The state changes behind the interactive keys, as explicit setters. The key
+# handler drives them as toggles; --batch drives them to an absolute value, so
+# a front-end that has its own buttons can set what it wants rather than
+# toggling blind and hoping its idea of the current state is still right.
+
+def set_head(usb: USB.Unit, st: State, head: int) -> None:
+    if st.args.heads != 2 or head == st.head:
+        return
+    st.head = head
+    # usb.seek() is what actually emits the head-select command. Just
+    # flipping st.head leaves the device reading the *old* head until the
+    # next physical step. Re-seek the current cylinder so the new head takes
+    # effect immediately (no movement, same cyl).
+    try_seek(usb, st, st.cyl)
+
+
+def set_motor(usb: USB.Unit, st: State, on: bool) -> None:
+    st.motor = on
+    usb.drive_motor(st.args.drive.unit_id, on)
+
+
+def set_select(usb: USB.Unit, st: State, on: bool) -> None:
+    # Deliberately independent of the motor: some drives gate their head
+    # load/unload solenoid off drive-select rather than motor-on, so this
+    # lets that be tested on its own, with the motor left running (or not)
+    # either way.
+    st.selected = on
+    if on:
+        usb.drive_select(st.args.drive.unit_id)
+    else:
+        usb.drive_deselect()
+
+
+def set_density(usb: USB.Unit, st: State, level: bool) -> None:
+    if st.args.gen_tg43:  # pin 2 is auto-tracked -- leave it alone
+        return
+    st.density = level
+    usb.set_pin(pinmap.DENSITY_SELECT_PIN, level)
 
 
 def handle_key(usb: USB.Unit, st: State, key: Optional[str]) -> bool:
@@ -201,32 +256,15 @@ def handle_key(usb: USB.Unit, st: State, key: Optional[str]) -> bool:
     elif key is not None and key.isdigit():
         try_seek(usb, st, int(key) * 10)
     elif key == 'h':
-        if st.args.heads == 2:
-            st.head = 1 - st.head
-            # usb.seek() is what actually emits the head-select command. Just
-            # flipping st.head leaves the device reading the *old* head until
-            # the next physical step. Re-seek the current cylinder so the new
-            # head takes effect immediately (no movement, same cyl).
-            try_seek(usb, st, st.cyl)
+        set_head(usb, st, 1 - st.head)
     elif key == 'r':
         recalibrate(usb, st)
     elif key == 'm':
-        st.motor = not st.motor
-        usb.drive_motor(st.args.drive.unit_id, st.motor)
+        set_motor(usb, st, not st.motor)
     elif key == 's':
-        # Deliberately independent of the motor: some drives gate their
-        # head load/unload solenoid off drive-select rather than motor-on,
-        # so this lets that be tested on its own, with the motor left
-        # running (or not) either way.
-        st.selected = not st.selected
-        if st.selected:
-            usb.drive_select(st.args.drive.unit_id)
-        else:
-            usb.drive_deselect()
+        set_select(usb, st, not st.selected)
     elif key == 'd':
-        if not st.args.gen_tg43:  # pin 2 is auto-tracked, 'd' is a no-op
-            st.density = not st.density
-            usb.set_pin(pinmap.DENSITY_SELECT_PIN, st.density)
+        set_density(usb, st, not st.density)
     return True
 
 
@@ -236,37 +274,43 @@ def drive_label(drive: util.Drive) -> str:
     return str(drive.unit_id)
 
 
-def status_line(usb: USB.Unit, st: State) -> str:
+class Reading(NamedTuple):
+    """One tick's worth of measurements, before any formatting.
+
+    Split out from the status line so the human-readable output and the
+    --batch JSON record are two renderings of the same sampled data rather
+    than two separate paths that can drift apart. Pin levels are the raw
+    electrical levels (True = high); this interface is active-low, so the
+    derived booleans alongside them carry the meaning.
+    """
+    drive: str
+    cyl: int
+    head: int
+    rpm: Optional[float]        # None when there was no reading this tick
+    motor: bool                 # False => rpm is 'off' rather than an error
+    sect: int
+    secs: Optional[int]         # expected count: given, guessed, or unknown
+    off_track: List[Tuple[int, int]]
+    selected: bool
+    density: bool               # level we are driving on the density pin
+    wp: Optional[bool]          # None when the pin could not be read back
+    tk0: Optional[bool]
+    dc: Optional[bool]
+
+
+def sample(usb: USB.Unit, st: State) -> Reading:
+    """Poll the pins and decode one flux capture from the current track."""
 
     args = st.args
 
-    sigs = {}
-    pin_of = {label: pin for label, pin, _ in pinmap.SIGNALS}
-    wp_level: Optional[bool] = None
-    tk0_level: Optional[bool] = None
-    for label, pin, ambiguous in pinmap.SIGNALS:
+    levels: dict = {}
+    for label, pin, _ambiguous in pinmap.SIGNALS:
         try:
-            level = usb.get_pin(pin)
+            levels[label] = usb.get_pin(pin)
         except USB.CmdError:
-            sigs[label] = '?'
-            continue
-        sigs[label] = ('H' if level else 'L') + ('?' if ambiguous else '')
-        if label == 'WP':
-            wp_level = level
-        elif label == 'TK0':
-            tk0_level = level
+            levels[label] = None
 
-    wp_str = sigs['WP']
-    if wp_level is not None:
-        # This interface is active-low: WP asserted (L) == write-protected.
-        wp_str += ' Unprot' if wp_level else ' Prot'
-
-    tk0_str = sigs['TK0']
-    if tk0_level is not None:
-        # Active-low: TK0 asserted (L) == head is at track 0.
-        tk0_str += ' OFF' if tk0_level else ' ON'
-
-    rpm_str, rpm_val, sect = 'off', None, 0
+    rpm_val, sect = None, 0
     off_track: List[Tuple[int, int]] = []
     if st.motor:
         # Bound the capture by *time*, not by index pulses: with no disk
@@ -293,20 +337,16 @@ def status_line(usb: USB.Unit, st: State) -> str:
             if len(flux.index_list) >= 2:
                 tpr = flux.index_list[-1] / flux.sample_freq
                 rpm_val = 60 / tpr
-                rpm_str = '%.2f' % rpm_val
                 st.last_rpm = rpm_val
                 time_per_rev = (60 / args.rpm) if args.rpm else tpr
                 mode = Mode.MFM if args.encoding == 'mfm' else Mode.FM
                 sect, off_track = decode.decode_tick(
                     flux, st.cyl, st.head, mode, args.rate, time_per_rev)
-            else:
-                rpm_str = 'ERR'
         except USB.CmdError:
-            rpm_str = 'ERR'
+            pass
         except Exception:
             # No disk / no index found, or garbage flux -- never let this
             # kill the session, just report nothing decoded this tick.
-            rpm_str = 'ERR'
             sect, off_track = 0, []
 
         if rpm_val is not None:
@@ -329,42 +369,147 @@ def status_line(usb: USB.Unit, st: State) -> str:
                 except Exception:
                     pass
 
-    ot_str = ('NO' if not off_track else
-             ','.join('T%d/S%d' % (c, n) for c, n in off_track))
+    return Reading(
+        drive=drive_label(args.drive), cyl=st.cyl, head=st.head,
+        rpm=rpm_val, motor=st.motor, sect=sect,
+        secs=(args.secs if args.secs is not None
+              else guess_secs(args.rate, rpm_val)),
+        off_track=off_track, selected=st.selected, density=st.density,
+        wp=levels['WP'], tk0=levels['TK0'], dc=levels['DC'])
 
-    secs = args.secs if args.secs is not None else guess_secs(args.rate, rpm_val)
-    secs_str = str(secs) if secs is not None else '?'
+
+def format_status(r: Reading) -> str:
+    """The human-readable live status line."""
+
+    ambiguous = {label: amb for label, _, amb in pinmap.SIGNALS}
+    pin_of = {label: pin for label, pin, _ in pinmap.SIGNALS}
+
+    def level_str(label: str, level: Optional[bool]) -> str:
+        if level is None:
+            return '?'
+        return ('H' if level else 'L') + ('?' if ambiguous[label] else '')
+
+    wp_str = level_str('WP', r.wp)
+    if r.wp is not None:
+        # This interface is active-low: WP asserted (L) == write-protected.
+        wp_str += ' Unprot' if r.wp else ' Prot'
+
+    tk0_str = level_str('TK0', r.tk0)
+    if r.tk0 is not None:
+        # Active-low: TK0 asserted (L) == head is at track 0.
+        tk0_str += ' OFF' if r.tk0 else ' ON'
+
+    if not r.motor:
+        rpm_str = 'off'
+    elif r.rpm is None:
+        rpm_str = 'ERR'
+    else:
+        rpm_str = '%.2f' % r.rpm
+
+    ot_str = ('NO' if not r.off_track else
+             ','.join('T%d/S%d' % (c, n) for c, n in r.off_track))
+
+    secs_str = str(r.secs) if r.secs is not None else '?'
 
     # Color the sector field: bright green on a complete read (every
     # expected sector decoded), bright red on anything short of that. Only
     # when the motor is spinning and we actually know the expected count --
     # a guessed/unknown '?' or a stopped motor leaves it uncolored.
-    sect_field = 'S%d/%s' % (sect, secs_str)
-    if st.motor and secs is not None:
-        color = _GREEN if sect == secs else _RED
+    sect_field = 'S%d/%s' % (r.sect, secs_str)
+    if r.motor and r.secs is not None:
+        color = _GREEN if r.sect == r.secs else _RED
         sect_field = '%s%s%s' % (color, sect_field, _RESET)
 
     # Color RPM green within +-5 of either standard spindle speed (300rpm
     # for 5.25"/8", 360rpm for 1.2MB HD), red otherwise. Left uncolored
     # when there's no reading at all ('off'/'ERR').
     rpm_field = rpm_str
-    if rpm_val is not None:
-        in_range = 295 <= rpm_val <= 305 or 355 <= rpm_val <= 365
+    if r.rpm is not None:
+        in_range = 295 <= r.rpm <= 305 or 355 <= r.rpm <= 365
         rpm_field = '%s%s%s' % (_GREEN if in_range else _RED, rpm_str, _RESET)
 
     return ('Drive %s: T%d, H%d, RPM %s, %s, OT %s, SEL:%s, MOT:%s, '
             'WP:%s, TK0:%s, DEN %d:%s, DC%d:%s' %
-            (drive_label(args.drive), st.cyl, st.head, rpm_field, sect_field,
-             ot_str, 'ON' if st.selected else 'OFF',
-             'ON' if st.motor else 'OFF', wp_str, tk0_str,
-             pinmap.DENSITY_SELECT_PIN, 'H' if st.density else 'L',
-             pin_of['DC'], sigs['DC']))
+            (r.drive, r.cyl, r.head, rpm_field, sect_field,
+             ot_str, 'ON' if r.selected else 'OFF',
+             'ON' if r.motor else 'OFF', wp_str, tk0_str,
+             pinmap.DENSITY_SELECT_PIN, 'H' if r.density else 'L',
+             pin_of['DC'], level_str('DC', r.dc)))
+
+
+TICK = 0.5  # seconds between status updates
+
+
+def run_batch(usb: USB.Unit, st: State) -> None:
+    """The --batch loop: JSON records out, text commands in.
+
+    Same measurements and same drive handling as the interactive loop -- only
+    the input and output ends differ. See batch.py for the protocol.
+    """
+
+    chan = batch.Channel()
+    st.chan = chan  # from here on, notice() emits events rather than printing
+    chan.start()
+    chan.send(batch.hello_record(
+        st.args, drive_label(st.args.drive),
+        {label: pin for label, pin, _ in pinmap.SIGNALS}))
+
+    sync_density_pin(usb, st)
+    recalibrate(usb, st)
+
+    next_tick = time.monotonic()
+    while True:
+        line = chan.poll()
+        if line == '':  # EOF: the front-end closed our stdin, so it is gone
+            break
+        if line is not None:
+            if not do_command(usb, st, batch.parse(line)):
+                break
+            continue  # drain the whole queue before spending time on a read
+
+        now = time.monotonic()
+        if now >= next_tick:
+            chan.send(batch.status_record(sample(usb, st)))
+            next_tick = now + TICK
+        else:
+            time.sleep(0.02)
+
+    chan.send({'t': 'bye'})
+
+
+def do_command(usb: USB.Unit, st: State, cmd) -> bool:
+    """Apply one parsed batch command. Returns False to request quit."""
+
+    op = cmd['op']
+    if op == 'quit':
+        return False
+    elif op == 'error':
+        notice(st, cmd['msg'], 'error')
+    elif op == 'goto':
+        try_seek(usb, st, cmd['n'])
+    elif op == 'step':
+        try_seek(usb, st, st.cyl + cmd['n'])
+    elif op == 'head':
+        set_head(usb, st, cmd['n'])
+    elif op == 'motor':
+        set_motor(usb, st, cmd['v'])
+    elif op == 'select':
+        set_select(usb, st, cmd['v'])
+    elif op == 'density':
+        set_density(usb, st, cmd['v'])
+    elif op == 'recal':
+        recalibrate(usb, st)
+    return True
 
 
 def run(usb: USB.Unit, args, delays: Delays) -> None:
 
-    enable_vt_colors()
     st = State(args, delays)
+    if args.batch:
+        run_batch(usb, st)
+        return
+
+    enable_vt_colors()
     print(cheatsheet())
     print(KEYLEGEND)
     if args.gen_tg43:
@@ -388,8 +533,8 @@ def run(usb: USB.Unit, args, delays: Delays) -> None:
 
             now = time.monotonic()
             if now >= next_tick:
-                print(status_line(usb, st))
-                next_tick = now + 0.5
+                print(format_status(sample(usb, st)))
+                next_tick = now + TICK
             else:
                 time.sleep(0.02)
 
@@ -430,6 +575,11 @@ def main(argv) -> None:
                         "matching --gen-tg43 in read/write/align. "
                         "Disables the d key, since pin 2 is then "
                         "under automatic control" % pinmap.TG43_TRACK_THRESHOLD)
+    parser.add_argument("--batch", action="store_true",
+                        help="machine-readable mode for a front-end hosting "
+                        "the diagnostic in its own UI: one JSON record per "
+                        "tick on stdout, plain-text commands on stdin, no "
+                        "terminal needed")
     parser.description = description
     parser.prog += ' ' + argv[1]
     args = parser.parse_args(argv[2:])
