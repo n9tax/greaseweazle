@@ -130,11 +130,15 @@ def status_record(r) -> Dict[str, Any]:
     }
 
 
-def hello_record(args, drive: str, pins: Dict[str, int]) -> Dict[str, Any]:
+def hello_record(args, drive: str, pins: Dict[str, int],
+                 mode: str = 'live') -> Dict[str, Any]:
     from greaseweazle import __version__
     return {
         't': 'hello',
-        'protocol': 1,
+        'protocol': 2,
+        # 'live' streams status until told to quit; 'scan' streams one record
+        # per track and exits. A front-end needs to know which it asked for.
+        'mode': mode,
         'version': __version__,
         # The display label ('A'/'B' on an IBM/PC bus, the unit number on a
         # Shugart one), matching the 'drive' field of every status record.

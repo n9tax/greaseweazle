@@ -19,7 +19,7 @@ from greaseweazle.codec import codec  # noqa: F401
 from greaseweazle.codec.ibm.ibm import Mode
 from greaseweazle.tools import util
 from greaseweazle.tools.delays import Delays
-from greaseweazle.tools.diag import pinmap, decode, keyboard, batch
+from greaseweazle.tools.diag import pinmap, decode, keyboard, batch, scan
 
 # ANSI color for the live sector count: bright green on a complete read,
 # bright red otherwise. Windows 10+ consoles support these once virtual-
@@ -502,9 +502,52 @@ def do_command(usb: USB.Unit, st: State, cmd) -> bool:
     return True
 
 
+def run_scan(usb: USB.Unit, st: State) -> None:
+    """Sweep every track measuring where its sectors physically sit.
+
+    One pass, no interaction: a record per track, then done. Unlike the live
+    loop this has a natural end, so it streams results and exits rather than
+    waiting to be told to stop.
+    """
+
+    args = st.args
+    chan = batch.Channel()
+    st.chan = chan
+    chan.send(batch.hello_record(
+        args, drive_label(args.drive),
+        {label: pin for label, pin, _ in pinmap.SIGNALS},
+        mode='scan'))
+
+    recalibrate(usb, st)  # start from a known position, as a read would
+    mode = Mode.MFM if args.encoding == 'mfm' else Mode.FM
+
+    for cyl in range(args.cyls):
+        for head in range(args.heads):
+            phys_cyl = cyl * 2 if args.double_step else cyl
+            try:
+                result = scan.scan_track(usb, cyl, head, phys_cyl,
+                                         args.rate, mode, args.revs)
+            except (error.Fatal, USB.CmdError) as e:
+                # A track that won't seek or read is worth reporting and
+                # stepping past: the rest of the surface still has something
+                # to say, and stopping would lose it.
+                notice(st, 'T%d.%d: %s' % (cyl, head, e), 'error')
+                continue
+            except Exception as e:
+                notice(st, 'T%d.%d: %s' % (cyl, head, e), 'error')
+                continue
+            st.cyl, st.head = cyl, head
+            chan.send(result.record())
+
+    chan.send({'t': 'bye'})
+
+
 def run(usb: USB.Unit, args, delays: Delays) -> None:
 
     st = State(args, delays)
+    if args.scan:
+        run_scan(usb, st)
+        return
     if args.batch:
         run_batch(usb, st)
         return
@@ -580,6 +623,15 @@ def main(argv) -> None:
                         "the diagnostic in its own UI: one JSON record per "
                         "tick on stdout, plain-text commands on stdin, no "
                         "terminal needed")
+    parser.add_argument("--scan", action="store_true",
+                        help="sweep every track once, reporting where each "
+                        "sector physically sits (its angle from the index "
+                        "pulse) rather than running interactively. Implies "
+                        "--batch: one JSON record per track on stdout, then "
+                        "exit")
+    parser.add_argument("--revs", type=util.min_int(1), default=3,
+                        metavar="N", help="revolutions to average each "
+                        "track over during --scan")
     parser.description = description
     parser.prog += ' ' + argv[1]
     args = parser.parse_args(argv[2:])
